@@ -1,0 +1,672 @@
+diff --git a/hm_configs/release/hm_detection_config_uni3d.py b/hm_configs/release/hm_detection_config_uni3d.py
+index 6eea540..27f5bd0 100644
+--- a/hm_configs/release/hm_detection_config_uni3d.py
++++ b/hm_configs/release/hm_detection_config_uni3d.py
+@@ -1,7 +1,7 @@
+ norm_cfg = dict(type='SyncBN', requires_grad=True)
+ # norm_cfg = dict(type='BN', requires_grad=True)
+ model = dict(
+-    type='HMMixedYoloV3',
++    type='HMMixedYoloV3Aimet',
+     pretrained=None,
+     backbone=dict(
+         type='HMResNet',
+diff --git a/mmdet/apis/train.py b/mmdet/apis/train.py
+index 402605a..a9eb171 100644
+--- a/mmdet/apis/train.py
++++ b/mmdet/apis/train.py
+@@ -14,6 +14,11 @@ from mmdet.core import DistEvalHook, EvalHook
+ from mmdet.datasets import (build_dataloader, build_dataset,
+                             replace_ImageToTensor)
+ from mmdet.utils import get_root_logger
++# imports for AIMET
++import aimet_common
++from aimet_torch import bias_correction
++from aimet_torch.cross_layer_equalization import equalize_model
++from aimet_torch.quantsim import QuantParams, QuantizationSimModel
+ 
+ 
+ def set_random_seed(seed, deterministic=False):
+@@ -35,6 +40,19 @@ def set_random_seed(seed, deterministic=False):
+         torch.backends.cudnn.benchmark = False
+ 
+ 
++def aimet_calibrate(model,
++                    data_loader):
++    model.eval()
++    sample=2
++    # results = []
++    # dataset = data_loader.dataset
++    # prog_bar = mmcv.ProgressBar(len(dataset))
++    for i, data in enumerate(data_loader):
++        with torch.no_grad():
++            result = model(return_loss=False, rescale=True, **data)    
++            if i > sample:
++                break
++
+ def train_detector(model,
+                    dataset,
+                    cfg,
+@@ -70,8 +88,23 @@ def train_detector(model,
+             dist=distributed,
+             seed=cfg.seed) for ds in dataset
+     ]
+-
++    #===========================================
++    # model.eval()
++    model.to('cuda:0')
++
++    dummy_input = torch.rand([1, 3, 544, 960], dtype=torch.float32, device='cuda:0')
++
++    quantsim = QuantizationSimModel(model=model, quant_scheme='tf_enhanced',
++                                    dummy_input=dummy_input, rounding_mode='nearest',
++                                    default_output_bw=8, default_param_bw=8, in_place=False)
++    #sim 
++    quantsim.compute_encodings(forward_pass_callback=aimet_calibrate,
++                               forward_pass_callback_args=data_loaders)
++    #qat
++    # accuracy = evaluator(quantsim.model, use_cuda=use_cuda)
++    #===========================================
+     # put model on gpus
++    # not sure for multi-gpus
+     if distributed:
+         find_unused_parameters = cfg.get('find_unused_parameters', False)
+         # Sets the `find_unused_parameters` parameter in
+@@ -81,12 +114,12 @@ def train_detector(model,
+             device_ids=[torch.cuda.current_device()],
+             broadcast_buffers=False,
+             find_unused_parameters=find_unused_parameters)
+-    else:
++    else: #now single GPU
+         model = MMDataParallel(
+-            model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+-
++            #model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
++            quantsim.model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+     # build runner
+-    optimizer = build_optimizer(model, cfg.optimizer)
++    optimizer = build_optimizer(quantisim.model, cfg.optimizer)
+ 
+     if 'runner' not in cfg:
+         cfg.runner = {
+@@ -172,3 +205,6 @@ def train_detector(model,
+     elif cfg.load_from:
+         runner.load_checkpoint(cfg.load_from)
+     runner.run(data_loaders, cfg.workflow)
++    #Export model
++    sim.export(path='./', filename_prefix='quantized_yolov3',  dummy_input=dummy_input.cpu())
++        onnx_export_args = OnnxExportApiArgs(input_names=['aimet']), opset_version=11))  #
+\ No newline at end of file
+diff --git a/mmdet/haomo/models/backbones/resnet.py b/mmdet/haomo/models/backbones/resnet.py
+index 655539c..6e678ff 100644
+--- a/mmdet/haomo/models/backbones/resnet.py
++++ b/mmdet/haomo/models/backbones/resnet.py
+@@ -31,25 +31,36 @@ class BasicBlock(nn.Module):
+         super(BasicBlock, self).__init__()
+         assert dcn is None, 'Not implemented yet.'
+         assert plugins is None, 'Not implemented yet.'
+-
+-        self.norm1_name, norm1 = build_norm_layer(norm_cfg, planes, postfix=1)
+-        self.norm2_name, norm2 = build_norm_layer(norm_cfg, planes, postfix=2)
+-
+-        self.conv1 = build_conv_layer(
+-            conv_cfg,
+-            inplanes,
+-            planes,
+-            3,
+-            stride=stride,
+-            padding=dilation,
+-            dilation=dilation,
+-            bias=False)
+-        self.add_module(self.norm1_name, norm1)
+-        self.conv2 = build_conv_layer(
+-            conv_cfg, planes, planes, 3, padding=1, bias=False)
+-        self.add_module(self.norm2_name, norm2)
+-
+-        self.relu = nn.ReLU(inplace=True)
++       #========================
++        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3,
++                              stride=stride, padding=dilation, dilation=dilation, bias=False)
++        self.bn1 = nn.BatchNorm2d(num_features=planes)
++        self.relu1 = nn.ReLU(inplace=True)
++
++        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
++                             padding=1,  bias=False)
++        self.bn2 = nn.BatchNorm2d(num_features=planes)
++        self.relu2 = nn.ReLU(inplace=True)
++        self.fadd = elementwise_ops.Add()
++       #========================
++        # self.norm1_name, norm1 = build_norm_layer(norm_cfg, planes, postfix=1)
++        # self.norm2_name, norm2 = build_norm_layer(norm_cfg, planes, postfix=2)
++
++        # self.conv1 = build_conv_layer(
++        #     conv_cfg,
++        #     inplanes,
++        #     planes,
++        #     3,
++        #     stride=stride,
++        #     padding=dilation,
++        #     dilation=dilation,
++        #     bias=False)
++        # self.add_module(self.norm1_name, norm1)
++        # self.conv2 = build_conv_layer(
++        #     conv_cfg, planes, planes, 3, padding=1, bias=False)
++        # self.add_module(self.norm2_name, norm2)
++
++        # self.relu = nn.ReLU(inplace=True)
+         self.downsample = downsample
+         self.stride = stride
+         self.dilation = dilation
+@@ -63,15 +74,15 @@ class BasicBlock(nn.Module):
+         else:
+             self.dropblock = None
+ 
+-    @property
+-    def norm1(self):
+-        """nn.Module: normalization layer after the first convolution layer"""
+-        return getattr(self, self.norm1_name)
++    # @property
++    # def norm1(self):
++    #     """nn.Module: normalization layer after the first convolution layer"""
++    #     return getattr(self, self.norm1_name)
+ 
+-    @property
+-    def norm2(self):
+-        """nn.Module: normalization layer after the second convolution layer"""
+-        return getattr(self, self.norm2_name)
++    # @property
++    # def norm2(self):
++    #     """nn.Module: normalization layer after the second convolution layer"""
++    #     return getattr(self, self.norm2_name)
+ 
+     def forward(self, x):
+         """Forward function."""
+@@ -80,17 +91,19 @@ class BasicBlock(nn.Module):
+             identity = x
+ 
+             out = self.conv1(x)
+-            out = self.norm1(out)
+-            out = self.relu(out)
++            out = self.bn1(out)
++            out = self.relu1(out)
+ 
+             out = self.conv2(out)
+-            out = self.norm2(out)
++            out = self.bn2(out)
+ 
+             if self.downsample is not None:
+                 identity = self.downsample(x)
+ 
+-            out += identity
+-
++            #========================
++            #out += identity #int8 a=b+c？
++            out = self.fadd(out, identity)
++            #=======================
+             return out
+ 
+         if self.with_cp and x.requires_grad:
+@@ -98,7 +111,7 @@ class BasicBlock(nn.Module):
+         else:
+             out = _inner_forward(x)
+ 
+-        out = self.relu(out)
++        out = self.relu2(out)
+ 
+         if self.dropblock is not None:
+             out = self.dropblock(out)
+@@ -315,7 +328,58 @@ class Bottleneck(nn.Module):
+         out = self.relu(out)
+ 
+         return out
+-
++#===============================================
++ def make_res_layer(
++                 block,
++                 inplanes,
++                 planes,
++                 num_blocks,
++                 stride=1,
++                 dilation=1,
++                #  avg_down=False,
++                 conv_cfg=None,
++                 norm_cfg=dict(type='BN'),
++                #  multi_grid=None,
++                #  contract_dilation=False,
++                #  **kwargs
++                ):
++        # self.block = block
++
++        downsample = None
++        if stride != 1 or inplanes != planes * block.expansion:
++           downsample = nn.Sequential(
++                nn.Conv2d(inplanes, planes * block.expansion, kernel_size=1,
++                              stride=stride, bias=False),
++                nn.BatchNorm2d(num_features=planes * block.expansion),
++            )
++
++        layers = []
++        layers.append(
++            block(
++                inplanes,
++                planes,
++                stride,
++                dilations[0],
++                downsample,
++                style=style,
++                with_cp=with_cp,
++                conv_cfg=conv_cfg,
++                norm_cfg=norm_cfg))
++            
++        inplanes = planes * block.expansion
++        for i in range(1, num_blocks):
++           layers.append(
++               block(
++                    inplanes,
++                    planes,
++                    1,
++                    dilations[i],
++                    style=style,
++                    with_cp=with_cp,
++                    conv_cfg=conv_cfg,
++                    norm_cfg=norm_cfg))
++        return nn.Sequential(*layers)
++#===========================================
+ 
+ @BACKBONES.register_module()
+ class HMResNet(nn.Module):
+@@ -456,7 +520,8 @@ class HMResNet(nn.Module):
+             stage_multi_grid = multi_grid if i == len(
+                 self.stage_blocks) - 1 else None
+             planes = base_channels * 2**i
+-            res_layer = self.make_res_layer(
++           # res_layer = self.make_res_layer(
++            res_layer = make_res_layer(
+                 block=self.block,
+                 inplanes=self.inplanes,
+                 planes=planes,
+@@ -464,15 +529,16 @@ class HMResNet(nn.Module):
+                 stride=stride,
+                 dilation=dilation,
+                 style=self.style,
+-                avg_down=self.avg_down,
++                # avg_down=self.avg_down,
+                 with_cp=with_cp,
+                 conv_cfg=conv_cfg,
+                 norm_cfg=norm_cfg,
+-                dropblock_cfg=dict(drop_ratio=drop_ratios[i], block_size=drop_blocksize) if drop_ratios is not None else None,
+-                dcn=dcn,
+-                plugins=stage_plugins,
+-                multi_grid=stage_multi_grid,
+-                contract_dilation=contract_dilation)
++                # dropblock_cfg=dict(drop_ratio=drop_ratios[i], block_size=drop_blocksize) if drop_ratios is not None else None,
++                # dcn=dcn,
++                # plugins=stage_plugins,
++                # multi_grid=stage_multi_grid,
++                # contract_dilation=contract_dilation
++                )
+             self.inplanes = planes * self.block.expansion
+             layer_name = f'layer{i+1}'
+             self.add_module(layer_name, res_layer)
+@@ -641,7 +707,7 @@ class HMResNet(nn.Module):
+                     if isinstance(m, Bottleneck):
+                         constant_init(m.norm3, 0)
+                     elif isinstance(m, BasicBlock):
+-                        constant_init(m.norm2, 0)
++                        constant_init(m.bn2, 0)
+         else:
+             raise TypeError('pretrained must be a str or None')
+ 
+@@ -651,8 +717,10 @@ class HMResNet(nn.Module):
+             x = self.stem(x)
+         else:
+             x = self.conv1(x)
+-            x = self.norm1(x)
+-            x = self.relu(x)
++            #========================
++            x = self.bn1(x)
++            x = self.relu1(x)
++            #======================
+         x = self.maxpool(x)
+         outs = []
+         for i, layer_name in enumerate(self.res_layers):
+diff --git a/mmdet/haomo/models/detectors/__init__.py b/mmdet/haomo/models/detectors/__init__.py
+index bc22cb5..d8798fa 100644
+--- a/mmdet/haomo/models/detectors/__init__.py
++++ b/mmdet/haomo/models/detectors/__init__.py
+@@ -1,5 +1,5 @@
+ from .haomo import Haomo_yolov3, Haomo_yolov3_2d, Haomo_yolov3_fake3d, Haomo_yolov3_union3d, Haomo_yolov3_union3dAndFake3d
+-from .hm_mixed_yolov3 import HMMixedYoloV3
++from .hm_mixed_yolov3 import HMMixedYoloV3Aimet
+ 
+ 
+ __all__ = ['Haomo_yolov3', 
+@@ -7,4 +7,4 @@ __all__ = ['Haomo_yolov3',
+            'Haomo_yolov3_fake3d', 
+            'Haomo_yolov3_union3d', 
+            'Haomo_yolov3_union3dAndFake3d',
+-           'HMMixedYoloV3']
+\ No newline at end of file
++           'HMMixedYoloV3Aimet']
+\ No newline at end of file
+diff --git a/mmdet/haomo/models/detectors/hm_mixed_yolov3.py b/mmdet/haomo/models/detectors/hm_mixed_yolov3.py
+index 930901a..0025cd0 100644
+--- a/mmdet/haomo/models/detectors/hm_mixed_yolov3.py
++++ b/mmdet/haomo/models/detectors/hm_mixed_yolov3.py
+@@ -5,7 +5,7 @@ from mmdet.models.detectors.base import BaseDetector
+ import numpy as np
+ 
+ @DETECTORS.register_module()
+-class HMMixedYoloV3(BaseDetector):
++class HMMixedYoloV3Aimet(BaseDetector):
+     def __init__(self,
+                  backbone,
+                  neck=None,
+@@ -126,7 +126,17 @@ class HMMixedYoloV3(BaseDetector):
+         losses.update(self.bbox_head_vehicle.forward_train(x, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore))
+         # losses.update(self.bbox_head_vru.forward_train(x, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore))
+         return losses
+-
++    #=============================================
++    def get_loss_mode(self,
++                      output,
++                      img_metas,
++                      gt_bboxes,
++                      gt_labels,
++                      gt_bboxes_ignore=None):
++        losses = dict()
++        losses.update(self.bbox_head_vehicle.get_loss(output, img_metas, gt_bboxes, gt_labels, gt_bboxes_ignore))
++        return losses
++   #===============================================
+     def bbox2result_vehicle(self, bboxes, labels, num_classes):
+         if bboxes.shape[0] == 0:
+             return [np.zeros((0, 40), dtype=np.float32) for i in range(num_classes)]
+diff --git a/mmdet/haomo/models/heads/vehicle_yolov3_head.py b/mmdet/haomo/models/heads/vehicle_yolov3_head.py
+index 9131dac..c53e790 100644
+--- a/mmdet/haomo/models/heads/vehicle_yolov3_head.py
++++ b/mmdet/haomo/models/heads/vehicle_yolov3_head.py
+@@ -33,15 +33,16 @@ class VehicleYOLOV3Head(YOLOV3BaseHead):
+                  **kwargs
+                  ):
+         super().__init__(num_classes, **kwargs)
+-        self.loss_direction = build_loss(loss_direction)
+-        #增加fake 3d点信息
+-        self.loss_points_cls = build_loss(loss_points_cls)
+-        self.loss_points_wh = build_loss(loss_points_wh)
+-        #增加3d信息
+-        self.loss_dimensions = build_loss(loss_dimensions)
+-        self.loss_positions = build_loss(loss_positions)
+-        self.loss_rotations = build_loss(loss_rotations)        
+-
++        #==========================================
++        # self.loss_direction = build_loss(loss_direction)
++        # #增加fake 3d点信息
++        # self.loss_points_cls = build_loss(loss_points_cls)
++        # self.loss_points_wh = build_loss(loss_points_wh)
++        # #增加3d信息
++        # self.loss_dimensions = build_loss(loss_dimensions)
++        # self.loss_positions = build_loss(loss_positions)
++        # self.loss_rotations = build_loss(loss_rotations)        
++        #==========================================
+     @property
+     def num_attrib(self):
+         return 4 + 1 + self.num_classes + 3 + 2 + 3 + 8 + 4 + 4*2 + 3 + 3 + 2
+@@ -265,15 +266,42 @@ class VehicleYOLOV3Head(YOLOV3BaseHead):
+         # target_3d_infos_exist_flag = target_map[..., 45]
+         # # 增加position 3d infos exist flag
+         # target_3d_position_exist_flag = target_map[..., 46]
++         #====================================================================================
++        # loss_cls = self.loss_cls(pred_label, target_label, weight=pos_mask)
++        loss_cls_param= dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0, reduction='sum')
++        loss_cls_cal = build_loss(loss_cls_param)
++        loss_cls = loss_cls_cal(pred_label, target_label, weight=pos_mask)
++
++        #loss_occlusion = self.loss_occlusion(pred_occlusion, target_occlusion, weight=pos_mask)
++        loss_occlusion_param= dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=0.0, reduction='sum')
++        loss_occlusion_cal = build_loss(loss_occlusion_param)
++        loss_occlusion = loss_occlusion_cal(pred_occlusion, target_occlusion, weight=pos_mask)
++
++        #loss_truncation = self.loss_truncation(pred_truncation, target_truncation, weight=pos_mask)
++        loss_truncation_param= dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=0.0, reduction='sum')
++        loss_truncation_cal = build_loss(loss_truncation_param)
++        loss_truncation = loss_truncation(pred_truncation, target_truncation, weight=pos_mask)
++
++        #loss_crowding = self.loss_crowding(pred_crowding, target_crowding, weight=pos_mask)
++        loss_crowding_param= dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=0.0, reduction='sum')
++        loss_crowding_cal = build_loss(loss_crowding_param)
++        loss_crowding = loss_crowding(pred_crowding, target_crowding, weight=pos_mask)
+         
+-        loss_cls = self.loss_cls(pred_label, target_label, weight=pos_mask)
+-        loss_occlusion = self.loss_occlusion(pred_occlusion, target_occlusion, weight=pos_mask)
+-        loss_truncation = self.loss_truncation(pred_truncation, target_truncation, weight=pos_mask)
+-        loss_crowding = self.loss_crowding(pred_crowding, target_crowding, weight=pos_mask)
+-        loss_conf = self.loss_conf(pred_conf, target_conf, weight=pos_and_neg_mask)
+-        loss_xy = self.loss_xy(pred_xy, target_xy, weight=pos_mask)
+-        loss_wh = self.loss_wh(pred_wh, target_wh, weight=pos_mask)
+-
++       # loss_conf = self.loss_conf(pred_conf, target_conf, weight=pos_and_neg_mask)
++       loss_conf_param= dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0, reduction='sum')
++       loss_conf_cal = build_loss(loss_conf_param)
++       loss_conf = self.loss_conf(pred_conf, target_conf, weight=pos_and_neg_mask)
++
++        #loss_xy = self.loss_xy(pred_xy, target_xy, weight=pos_mask)
++       loss_xy_param= dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=2.0, reduction='sum')
++       loss_xy_cal = build_loss(loss_xy_param)
++       loss_xy = loss_xy(pred_xy, target_xy, weight=pos_mask)
++
++        #loss_wh = self.loss_wh(pred_wh, target_wh, weight=pos_mask)
++        loss_wh_param= dict(type='MSELoss', use_sigmoid=True, loss_weight=2.0, reduction='sum')
++        loss_wh_cal = build_loss(loss_wh_param)
++        loss_wh = loss_wh(pred_wh, target_wh, weight=pos_mask)
++        #=======================================================================================
+         #fake3d exist flag weight
+         fake3d_exist_flag_weights = target_fake3d_exist_flag.unsqueeze(-1)
+ 
+diff --git a/mmdet/haomo/models/heads/vru_yolov3_head.py b/mmdet/haomo/models/heads/vru_yolov3_head.py
+index db54bfa..4d3975b 100644
+--- a/mmdet/haomo/models/heads/vru_yolov3_head.py
++++ b/mmdet/haomo/models/heads/vru_yolov3_head.py
+@@ -318,6 +318,7 @@ class VRUYOLOV3Head(YOLOV3BaseHead):
+         target_truncation =target_map[..., 12:14]
+         target_crowding = target_map[..., 14:17]
+         target_onRoad = target_map[..., 17:19]
++       
+         loss_cls_vru = self.loss_cls(pred_label, target_label, weight=pos_mask)
+         loss_conf_vru = self.loss_conf(
+             pred_conf, target_conf, weight=pos_and_neg_mask)
+diff --git a/mmdet/haomo/models/heads/yolov3_base_head.py b/mmdet/haomo/models/heads/yolov3_base_head.py
+index 156f892..4a8efe8 100644
+--- a/mmdet/haomo/models/heads/yolov3_base_head.py
++++ b/mmdet/haomo/models/heads/yolov3_base_head.py
+@@ -85,15 +85,15 @@ class YOLOV3BaseHead(BaseDenseHead, BBoxTestMixin):
+ 
+         self.bbox_coder = build_bbox_coder(bbox_coder)
+         self.anchor_generator = build_anchor_generator(anchor_generator)
+-
+-        self.loss_cls = build_loss(loss_cls)
+-        self.loss_conf = build_loss(loss_conf)
+-        self.loss_xy = build_loss(loss_xy)
+-        self.loss_wh = build_loss(loss_wh)
+-        self.loss_occlusion = build_loss(loss_occlusion)
+-        self.loss_truncation = build_loss(loss_truncation)
+-        self.loss_crowding = build_loss(loss_crowding)
+-
++        #============================================
++        # self.loss_cls = build_loss(loss_cls)
++        # self.loss_conf = build_loss(loss_conf)
++        # self.loss_xy = build_loss(loss_xy)
++        # self.loss_wh = build_loss(loss_wh)
++        # self.loss_occlusion = build_loss(loss_occlusion)
++        # self.loss_truncation = build_loss(loss_truncation)
++        # self.loss_crowding = build_loss(loss_crowding)
++       #===================================================
+         # usually the numbers of anchors for each level are the same
+         # except SSD detectors
+         self.num_anchors = self.anchor_generator.num_base_anchors[0]
+diff --git a/mmdet/models/dense_heads/base_dense_head.py b/mmdet/models/dense_heads/base_dense_head.py
+index 0a2d052..496ca09 100644
+--- a/mmdet/models/dense_heads/base_dense_head.py
++++ b/mmdet/models/dense_heads/base_dense_head.py
+@@ -58,7 +58,27 @@ class BaseDenseHead(BaseModule, metaclass=ABCMeta):
+         else:
+             proposal_list = self.get_bboxes(*outs, img_metas, cfg=proposal_cfg)
+             return losses, proposal_list
+-
++    #===========================================
++    def get_loss(self,
++                      output,
++                      img_metas,
++                      gt_bboxes,
++                      gt_labels=None,
++                      gt_bboxes_ignore=None,
++                      proposal_cfg=None,
++                      **kwargs):
++                      
++        if gt_labels is None:
++            loss_inputs = outs + (gt_bboxes, img_metas)
++        else:
++            loss_inputs = outs + (gt_bboxes, gt_labels, img_metas)
++        losses = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
++        if proposal_cfg is None:
++            return losses
++        else:
++            proposal_list = self.get_bboxes(*outs, img_metas, cfg=proposal_cfg)
++            return losses, proposal_list
++    #===========================================
+     def simple_test(self, feats, img_metas, rescale=False):
+         """Test function without test-time augmentation.
+ 
+diff --git a/mmdet/models/detectors/base.py b/mmdet/models/detectors/base.py
+index 0f7b9f1..10a97c9 100644
+--- a/mmdet/models/detectors/base.py
++++ b/mmdet/models/detectors/base.py
+@@ -235,7 +235,12 @@ class BaseDetector(BaseModule, metaclass=ABCMeta):
+                   DDP, it means the batch size on each GPU), which is used for
+                   averaging the logs.
+         """
+-        losses = self(**data)
++        #=====================
++        #losses = self(**data)
++        img = data['img']
++        outs = self.forward_dummy(img)
++        losses = self.get_loss_mode(outs, data['img_metas'], data['gt_bboxes'], data['gt_labels'])
++        #===================
+         loss, log_vars = self._parse_losses(losses)
+ 
+         outputs = dict(
+@@ -250,9 +255,13 @@ class BaseDetector(BaseModule, metaclass=ABCMeta):
+         during val epochs. Note that the evaluation after training epochs is
+         not implemented with this method, but an evaluation hook.
+         """
+-        losses = self(**data)
++        #================================
++        #losses = self(**data)
++        img = data['img']
++        outs = self.forward_dummy(img)
++        losses = self.get_loss_mode(outs, data['img_metas'], data['gt_bboxes'], data['gt_labels'])
+         loss, log_vars = self._parse_losses(losses)
+-
++        #=================================
+         outputs = dict(
+             loss=loss, log_vars=log_vars, num_samples=len(data['img_metas']))
+ 
+diff --git a/mmdet/models/necks/yolo_neck.py b/mmdet/models/necks/yolo_neck.py
+index c8eeb57..07cbc4b 100644
+--- a/mmdet/models/necks/yolo_neck.py
++++ b/mmdet/models/necks/yolo_neck.py
+@@ -3,12 +3,33 @@
+ 
+ import torch
+ import torch.nn.functional as F
++import torch.nn as nn
+ from mmcv.cnn import ConvModule
+ from mmcv.runner import BaseModule
+ 
+ from ..builder import NECKS
+ 
+ 
++
++class ConvBnReLU(nn.Module):
++    def __init__(self, int_channels, out_channels, kernel_size, stride=1,
++                                padding=0, dilation=1, groups=1, bias=false,
++                                conv_cfg=None, norm_cfg=None, act_cfg=None):
++            super(ConvBnReLU, self).__init__()
++            self.norm_cfg = norm_cfg
++            self.activation = act_cfg
++            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, 
++                                                            stride=stride, padding=padding, dilation=dilation, groups=groups,
++                                                            bias=bias)
++             self.bn = nn.BatchNorm2d(num_features=out_channels)
++             self.relu = nn.LeakyReLU(negative_slope=0.1, inplace) 
++    
++    def forward(self.x):
++        x = self.conv(x)
++        x= self.bn(x)
++        x = self.relu(x)
++        return x
++
+ class DetectionBlock(BaseModule):
+     """Detection block in YOLO neck.
+ 
+@@ -44,13 +65,20 @@ class DetectionBlock(BaseModule):
+ 
+         # shortcut
+         cfg = dict(conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg)
+-        self.conv1 = ConvModule(in_channels, out_channels, 1, **cfg)
+-        self.conv2 = ConvModule(
++        # self.conv1 = ConvModule(in_channels, out_channels, 1, **cfg)
++        # self.conv2 = ConvModule(
++        #     out_channels, double_out_channels, 3, padding=1, **cfg)
++        # self.conv3 = ConvModule(double_out_channels, out_channels, 1, **cfg)
++        # self.conv4 = ConvModule(
++        #     out_channels, double_out_channels, 3, padding=1, **cfg)
++        # self.conv5 = ConvModule(double_out_channels, out_channels, 1, **cfg)
++        self.conv1 = ConvBnReLU(in_channels, out_channels, 1, **cfg)
++        self.conv2 = ConvBnReLU(
+             out_channels, double_out_channels, 3, padding=1, **cfg)
+-        self.conv3 = ConvModule(double_out_channels, out_channels, 1, **cfg)
+-        self.conv4 = ConvModule(
++        self.conv3 = ConvBnReLU(double_out_channels, out_channels, 1, **cfg)
++        self.conv4 = ConvBnReLU(
+             out_channels, double_out_channels, 3, padding=1, **cfg)
+-        self.conv5 = ConvModule(double_out_channels, out_channels, 1, **cfg)
++        self.conv5 = ConvBnReLU(double_out_channels, out_channels, 1, **cfg)
+ 
+     def forward(self, x):
+         tmp = self.conv1(x)
+@@ -109,13 +137,19 @@ class YOLOV3Neck(BaseModule):
+         # To support arbitrary scales, the code looks awful, but it works.
+         # Better solution is welcomed.
+         self.detect1 = DetectionBlock(in_channels[0], out_channels[0], **cfg)
++        #=====================================================================
++        self.upsample1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
++        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
++        #======================================================================
+         for i in range(1, self.num_scales):
+             in_c, out_c = self.in_channels[i], self.out_channels[i]
+             inter_c = out_channels[i - 1]
+-            self.add_module(f'conv{i}', ConvModule(inter_c, out_c, 1, **cfg))
++            self.add_module(f'conv{i}', ConvBnReLU(inter_c, out_c, 1, **cfg))
+             # in_c + out_c : High-lvl feats will be cat with low-lvl feats
+             self.add_module(f'detect{i+1}',
+                             DetectionBlock(in_c + out_c, out_c, **cfg))
++        self.fcat1 = elementwise_ops.Concat( axis=1 )
++        self.fcat2 = elementwise_ops.Concat( axis=1 )
+ 
+     def forward(self, feats):
+         assert len(feats) == self.num_scales
+@@ -130,8 +164,12 @@ class YOLOV3Neck(BaseModule):
+             tmp = conv(out)
+ 
+             # Cat with low-lvl feats
+-            tmp = F.interpolate(tmp, scale_factor=2)
+-            tmp = torch.cat((tmp, x), 1)
++            if i== 0:
++                tmp = self.upsample1(tmp)
++                tmp = self.fcat1(tmp, x)
++            else:
++                tmp = self.upsample2(tmp)
++                tmp = self.fcat2(tmp, x)
+ 
+             detect = getattr(self, f'detect{i+2}')
+             out = detect(tmp)
